@@ -1,0 +1,19 @@
+收款人信息模板如下：
+
+Beneficiary Name: ZHANG YAO
+Beneficiary Account No.: 你的工行完整账号
+Beneficiary Telephone: +86 19293846552
+Beneficiary Address: ROOM 2306, BUILDING A, ZHENGSHANG HANGHAI PLAZA, SOUTHWEST CORNER OF HANGHAI ROAD AND LIANYUN ROAD INTERSECTION, ERQI DISTRICT, ZHENGZHOU CITY, HENAN PROVINCE, CHINA
+
+简写：RM 2306, BLDG A, ZHENGSHANG HANGHAI PLAZA, SW CORNER OF HANGHAI RD & LIANYUN RD, ERQI DIST, ZHENGZHOU, HENAN, CHINA
+
+Bank Name: 你查到的收款行英文名称
+SWIFT Code: 你查到的SWIFT代码
+Bank Address: 你查到的收款行英文地址
+Remittance Information: ZHANG YAO +8619293846552
+
+注意两点：
+
+收款人姓名仍以工行账户户名为准，如果户名是“ZHANG YAO”，就填全大写“ZHANG YAO”。
+
+地址用全大写英文没问题；但不要中英文混填。如果工行开户时预留的英文地址与此不同，优先保证能联系到你，必要时可同时按银行预留地址填写。
