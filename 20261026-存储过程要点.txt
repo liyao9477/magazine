@@ -1,0 +1,153 @@
+前面几轮你踩过的坑、纠正过的结构，正好构成一份“复杂存储过程设计检查清单”。我按**决策顺序**组织，而不是按语法罗列——因为写复杂过程时，**先定架构，再定结构，最后抠标点**，顺序反了就会像你第二版那样“语法对了、语义错了”。
+
+---
+
+## 一、动笔之前：先做两个架构决策
+
+**决策一：整体原子，还是分批提交？**
+
+这是所有设计的起点，决定后面要不要 `EXCEPTION`、要不要 `COMMIT`。
+
+| | 整体原子 | 分批提交 |
+|---|---|---|
+| 事务控制 | 不需要 `COMMIT`，`CALL` 本身就是一个事务 | 循环内 `COMMIT`，每批独立落地 |
+| 异常处理 | 可以不写 `EXCEPTION`，未捕获异常自动全量回滚 | 必须写，但只能“捕获 + 跳过/退出”，不能在里面提交 |
+| 失败后果 | 全部回滚，干净 | **部分成功不可撤销**，这是固有代价 |
+| 适用场景 | 数据量可控、要求强一致 | 百万级清理、要求缩短锁窗口 |
+
+**关键判断**：如果你要求“任何一批失败，前面已成功的批次也必须撤销”，那么**分批提交方案从根上就做不到**——已经 `COMMIT` 的数据无法被后续 `ROLLBACK` 找回。这种需求只能走“整体原子”，或者引入补偿逻辑（反向操作表、状态机），而不是靠存储过程的事务控制解决。
+
+**决策二：用 `PROCEDURE` 还是 `FUNCTION`？**
+
+- 需要**中途提交** → 只能用 `PROCEDURE`，`FUNCTION` 永远被包在单一事务里，`COMMIT` 直接报 `invalid transaction termination`。
+- 需要**返回结果集** → `FUNCTION` 有 `RETURNS TABLE` / `SETOF`；`PROCEDURE` 没有 `RETURNS`，只能靠 `OUT`/`INOUT` 标量参数或 `REFCURSOR`，而 **`COMMIT` 会自动关闭所有已打开游标**，二者天然冲突。
+- 只是封装 DML、不需要事务控制 → 两者皆可，`PROCEDURE` 语义更贴切。
+
+---
+
+## 二、块结构与标点：结构关键字不是语句
+
+这是最容易“低级但致命”的地方：
+
+- **`BEGIN` 后面不能加分号**，`DECLARE` 后面也不能加分号——它们是结构标记，不是语句。
+- **`END IF;`、`END LOOP;` 的分号不能省**，它们作为语句列表中的一项，需要终止符。
+- **内层子块的 `END` 必须有分号**；最外层 `END` 的分号可省，但**统一都加**，避免嵌套时漏掉。
+- **每个 `IF` 配自己的 `END IF`**，不能用一个闭合多层嵌套。
+- `IF ... ELSIF ... ELSE ... END IF` 是**短路求值**：第一个为真的分支执行后直接跳到 `END IF` 之后，后续 `ELSIF` 不再判断。
+
+---
+
+## 三、事务控制：四条红线，一条铁律
+
+**铁律：`EXCEPTION` 块是子事务，块内禁止 `COMMIT` / `ROLLBACK`。**
+
+进入 `BEGIN ... EXCEPTION ... END` 时 PostgreSQL 设置保存点，退出时释放；在块内终结事务会报 `cannot commit while a subtransaction is active`（SQLSTATE `2D000`）。**而且你不需要手动 `ROLLBACK`**——进入异常处理器时，子事务已经自动回滚到保存点了，再写 `ROLLBACK` 是冗余且非法的。
+
+`PROCEDURE` 里 `COMMIT` 的四个禁区：
+
+1. **`SECURITY DEFINER` 的过程**——安全上下文栈非空，禁止启动新事务；
+2. **`EXCEPTION` 块内部**——子事务活跃；
+3. **带 `SET` 配置子句的过程**——同样被禁止；
+4. **非只读命令驱动的游标 `FOR` 循环体内**——提交会关闭游标，导致循环异常。
+
+**正确的提交位置**：`COMMIT` 必须放在 `BEGIN ... EXCEPTION ... END` 的 `END;` **之后**，此时保存点已释放，子事务不再活跃。失败批次走 `CONTINUE` 时会跳过底部的 `COMMIT`，这意味着**失败批次之前已成功的批次仍留在当前事务中，等下一轮成功批次一并提交**——这个语义要显式想清楚，而不是默认它“应该”怎样。
+
+---
+
+## 四、异常处理：捕获什么、捕获后做什么
+
+- **`EXCEPTION` 只在确实需要“单批失败不影响整体”时才写**。整体原子方案下，不写 `EXCEPTION` 反而更安全——未捕获异常自动全量回滚，不会留下半成品。
+- **按 SQLSTATE 精确捕获**（`unique_violation`、`foreign_key_violation`、`deadlock_detected`），最后用 `WHEN OTHERS` 兜底并记录 `SQLERRM` / `SQLSTATE`。
+- **异常分支里只做三件事**：`RAISE NOTICE` / 写日志表、`CONTINUE` 或 `EXIT`、必要的 `pg_sleep` 重试等待。**不要做事务控制**。
+- **`GET DIAGNOSTICS ... ROW_COUNT` 必须紧跟 `DELETE`/`UPDATE`，且在同一个子事务内**；移到异常块外，一旦 DML 失败，`ROW_COUNT` 就不再对应你期望的那一批。
+- **死锁重试要有上限**，否则 `CONTINUE` + `pg_sleep` 可能变成事实上的无限循环；把重试次数计入 `v_batch_count` 或单独计数器。
+
+---
+
+## 五、循环与批量处理：确定性 + 安全阀
+
+- **`LOOP` 无退出条件，必须在体内 `EXIT` / `RETURN`**；批量清理至少要有两道阀：`EXIT WHEN v_rows = 0`（自然结束）和 `EXIT WHEN v_batch_count >= v_max_batches`（防条件写错导致无限循环）。
+- **`WHILE` 先判断后执行**，条件为假一次都不进；**`FOR i IN 1..n` 的上下界只在进入时求值一次**，下界大于上界时**静默跳过不报错**——这正好适合“总批次数为 0 时自然不循环”。
+- **批量取数必须可预测**：`DELETE ... WHERE id IN (SELECT id FROM t ORDER BY id LIMIT N)` 比无 `ORDER BY` 的 `LIMIT` 安全得多，避免“删了又出现 / 某些行永远选不到”。但要知道 **`READ COMMITTED` 下子查询不锁行**，并发写入可能导致单批删不满 N 行，循环会自然处理剩余行，这是可接受的。
+- **`EXIT WHEN v_rows = 0` 放在 `COMMIT` 之前**：没删任何行就不必提交空事务，退出时机和提交时机解耦。
+- **`CONTINUE` 跳过的是当前迭代剩余语句**，包括底部的 `COMMIT`；**`EXIT` 是彻底退出**。二者语义不同，异常分支里选哪个要显式决定。
+
+---
+
+## 六、结果返回：`PROCEDURE` 没有 `SETOF`
+
+- `PROCEDURE` 无 `RETURNS` 子句；返回标量用 `OUT` / `INOUT` 参数（PG 14+），**注意 PostgreSQL 的 `PROCEDURE` 实际不支持 `OUT` 参数，输出应使用 `INOUT`**。
+- 返回多行用 `REFCURSOR`，但**一旦过程内 `COMMIT`，游标自动关闭**；若既要分批提交又要返回结果集，先把结果落到临时表/持久表，调用方再读表，而不是指望游标活着。
+- 过程执行结果（删了多少、跑了几批、哪些批失败）**用 `RAISE NOTICE` 不够可靠**，生产级做法是写一张进度/日志表，且日志写入要考虑是否参与同一事务。
+
+---
+
+## 七、生命周期：`CREATE OR REPLACE` 与 `DROP` 的边界
+
+- 日常迭代优先 `CREATE OR REPLACE`：**保留属主和权限**，不破坏依赖对象的引用关系。
+- **`FUNCTION` 改返回类型（含 `OUT` 参数类型）不能用 `CREATE OR REPLACE`**，必须 `DROP` 重建；`PROCEDURE` 无返回类型，但**改参数类型等于新建重载**，不是替换。
+- `DROP` 默认 `RESTRICT`，有依赖就拒绝；**`CASCADE` 会递归删依赖对象**（视图、触发器、调用它的上层过程），生产环境先查依赖再决定。**`DROP` 后重建是新 OID，原有依赖不会自动“认回”新对象**——这正是优先 `CREATE OR REPLACE` 的原因。
+- 参数列表变更（如 `(p_days int)` → `(p_days int, p_limit int)`）**不是替换而是新增重载**；要真正“改签名”，得 `DROP` 旧签名再建新的，并处理调用方依赖。
+
+---
+
+## 八、可复用的骨架（分批提交 + 单批异常保护）
+
+```sql
+CREATE OR REPLACE PROCEDURE p_clean(
+    INOUT p_total_deleted bigint DEFAULT 0,
+    INOUT p_failed_batches integer DEFAULT 0
+) LANGUAGE plpgsql AS $$
+DECLARE
+    v_rows        bigint;
+    v_batch       integer := 0;
+    v_max_batches constant integer := 1000;   -- 安全阀
+BEGIN
+    LOOP
+        EXIT WHEN v_batch >= v_max_batches;
+
+        BEGIN
+            DELETE FROM t
+            WHERE id IN (SELECT id FROM t ORDER BY id LIMIT 100);
+            GET DIAGNOSTICS v_rows = ROW_COUNT;
+        EXCEPTION
+            WHEN deadlock_detected THEN
+                RAISE NOTICE '死锁，等待重试';
+                PERFORM pg_sleep(1);
+                p_failed_batches := p_failed_batches + 1;
+                CONTINUE;                       -- 跳过本批，不提交
+            WHEN OTHERS THEN
+                RAISE NOTICE '批次失败: % (SQLSTATE: %)', SQLERRM, SQLSTATE;
+                p_failed_batches := p_failed_batches + 1;
+                CONTINUE;
+        END;
+
+        -- 子事务已结束，此处 COMMIT 合法
+        COMMIT;
+
+        EXIT WHEN v_rows = 0;                   -- 先判空再提交更干净
+        p_total_deleted := p_total_deleted + v_rows;
+        v_batch := v_batch + 1;
+    END LOOP;
+END;
+$$;
+```
+
+注意骨架里 `EXIT WHEN v_rows = 0` 与 `COMMIT` 的相对位置：**空批不提交、直接退出**；非空批先提交、再累加计数。失败批次走 `CONTINUE` 跳过 `COMMIT`，其之前成功的批次会在下一轮成功批次的 `COMMIT` 时一并落地——**这个“延迟提交”语义必须是你有意选择的，而不是碰巧写出来的**。
+
+---
+
+## 九、写完之前的自检清单
+
+1. 我选的是**整体原子**还是**分批提交**？失败时“部分成功”能否接受？
+2. 有没有任何 `COMMIT` / `ROLLBACK` 落在 `EXCEPTION` 块内部？（有则必错）
+3. `PROCEDURE` 是否声明了 `SECURITY DEFINER` 或 `SET`？如果是，还敢用 `COMMIT` 吗？
+4. 循环有没有**两道阀**（自然结束 + 最大批次）？死锁重试有没有上限？
+5. 批量取数有没有 `ORDER BY`？并发场景下“删不满一批”是否可接受？
+6. `GET DIAGNOSTICS` 是否紧跟在 DML 之后、在同一个子事务内？
+7. 如果需要返回结果集，`COMMIT` 会不会把游标关掉？是否该改用临时表？
+8. 改签名时，是 `CREATE OR REPLACE`（改不了返回类型/参数类型）还是 `DROP` + 重建？`DROP` 选 `RESTRICT` 还是 `CASCADE`，依赖查过没有？
+
+---
+
+**下一步建议**：把这个骨架实际跑一遍——建一张测试表，灌 1000 行，故意在某一批制造一个外键冲突，观察 `p_failed_batches` 的计数、已成功批次的落地情况、以及 `RAISE NOTICE` 的输出顺序。**只有亲眼看到“失败批次之前的数据被保留、失败批次被回滚、后续批次继续”**，你对“分批提交 + 异常保护”的语义才算真正巩固。
