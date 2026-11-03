@@ -1,0 +1,14 @@
+1.pgsql-30d
+2.finalcial free books
+3.dict star                   ok
+4.github-app
+5.agent handbook
+
+a.deeptutor    
+b.topwriters.me                   ok
+c.xiaoyang111222/cn-math-toxonomy
+d.diagram-design
+e.iyywiki.cn               ok
+
+docker 安装deeptutor
+docker run --rm --name deeptutor   -p 127.0.0.1:3782:3782  -v deeptutor-data:/app/data  ghcr.io/hkuds/deeptutor:latest

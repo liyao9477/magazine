@@ -1,0 +1,37 @@
+你之前问过中位数。PostgreSQL 没有内置 median()，但可以用聚合函数实现。中位数的难点在于：它不是逐行可合并的简单累加——你不能说“前 5 行的中位数”和“第 6 行”合并出“前 6 行的中位数”。它需要保留所有值，最后排序取中间。
+
+所以中位数聚合的设计是：
+状态类型：一个数组（float8[]），把所有值收集起来；
+状态转移函数：把新值追加到数组；
+最终函数：对数组排序，取中间值（奇数取中间，偶数取平均）。
+
+SQL:
+	
+-- 状态转移：追加元素
+CREATE FUNCTION median_accum(float8[], float8)
+RETURNS float8[] AS $$
+  SELECT $1 || $2;
+$$ LANGUAGE SQL IMMUTABLE;
+
+-- 最终计算：排序后取中位
+CREATE FUNCTION median_final(float8[])
+RETURNS float8 AS $$
+  SELECT CASE
+    WHEN array_length($1, 1) IS NULL THEN NULL
+    WHEN array_length($1, 1) % 2 = 1 THEN
+      (SELECT x FROM unnest($1) x ORDER BY x
+       OFFSET array_length($1,1)/2 LIMIT 1)
+    ELSE
+      (SELECT avg(x) FROM (
+         SELECT x FROM unnest($1) x ORDER BY x
+         OFFSET array_length($1,1)/2 - 1 LIMIT 2
+       ) t)
+  END;
+$$ LANGUAGE SQL IMMUTABLE;
+
+CREATE AGGREGATE median(float8) (
+  sfunc    = median_accum,
+  stype    = float8[],
+  finalfunc = median_final,
+  initcond = '{}'
+);
